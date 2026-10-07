@@ -1,4 +1,5 @@
 import logging
+import time
 from hashlib import sha256
 from typing import Callable
 from typing import Optional
@@ -18,6 +19,11 @@ from idpyoidc.metadata import get_signing_algs
 from idpyoidc.server.client_authn import BearerHeader
 
 logger = logging.getLogger(__name__)
+
+#: Accepted distance (seconds) between a proof's iat and the server clock
+DPOP_IAT_WINDOW = 300
+#: JWK members that only a private or symmetric key has
+NON_PUBLIC_JWK_MEMBERS = {"d", "p", "q", "dp", "dq", "qi", "k"}
 
 
 class DPoPProof(Message):
@@ -70,12 +76,24 @@ class DPoPProof(Message):
         _sjwt = _jws.sign_compact(keys=[self.key], **_headers)
         return _sjwt
 
-    def verify_header(self, dpop_header) -> Optional["DPoPProof"]:
+    def verify_header(self, dpop_header, allowed_algs=None) -> Optional["DPoPProof"]:
+        """Verify the proof's signature with its own (public, asymmetric) jwk.
+
+        :param allowed_algs: the accepted signing algorithms; any asymmetric one if None
+        """
         _jws = factory(dpop_header)
         if _jws:
             _jwt = _jws.jwt
             if "jwk" in _jwt.headers:
-                _pub_key = key_from_jwk_dict(_jwt.headers["jwk"])
+                _jwk = _jwt.headers["jwk"]
+                if not isinstance(_jwk, dict) or _jwk.get("kty") == "oct" or NON_PUBLIC_JWK_MEMBERS & set(_jwk):
+                    raise ValueError("DPoP 'jwk' must be a public asymmetric key")
+                _alg = _jwt.headers.get("alg")
+                if not _alg or _alg == "none" or _alg.startswith("HS"):
+                    raise ValueError("DPoP must be signed with an asymmetric algorithm")
+                if allowed_algs is not None and _alg not in allowed_algs:
+                    raise ValueError(f"DPoP signing algorithm {_alg} is not supported")
+                _pub_key = key_from_jwk_dict(_jwk)
                 _pub_key.deserialize()
                 _info = _jws.verify_compact(keys=[_pub_key], sigalg=_jwt.headers["alg"])
                 for k, v in _jwt.headers.items():
@@ -89,6 +107,16 @@ class DPoPProof(Message):
             return self
         else:
             return None
+
+
+def _allowed_algs(context):
+    return (getattr(context, "add_on", {}) or {}).get("dpop", {}).get("algs_supported")
+
+
+def _check_iat(dpop):
+    _iat = dpop.get("iat")
+    if not isinstance(_iat, int) or abs(time.time() - _iat) > DPOP_IAT_WINDOW:
+        raise ValueError("DPoP 'iat' is outside the accepted window")
 
 
 def token_post_parse_request(request, client_id, context, **kwargs):
@@ -110,15 +138,15 @@ def token_post_parse_request(request, client_id, context, **kwargs):
     if "dpop" not in _http_info["headers"]:
         return request
 
-    _dpop = DPoPProof().verify_header(_http_info["headers"]["dpop"])
+    _dpop = DPoPProof().verify_header(_http_info["headers"]["dpop"], _allowed_algs(context))
 
     # The signature of the JWS is verified, now for checking the
     # content
-    allowed_htu = kwargs.get("allowed_htu")
+    allowed_htu = kwargs.get("allowed_htu") or [_http_info.get("url", "").split("?")[0]]
 
-    # if _dpop["htu"] != _http_info["url"]:
     if _dpop.get("htu") not in allowed_htu:
         raise ValueError("htu in DPoP does not match the HTTP URI")
+    _check_iat(_dpop)
 
     if _dpop["htm"] != _http_info["method"]:
         raise ValueError("htm in DPoP does not match the HTTP method")
@@ -147,13 +175,14 @@ def userinfo_post_parse_request(request, client_id, context, auth_info, **kwargs
     if not _http_info:
         return request
 
-    _dpop = DPoPProof().verify_header(_http_info["headers"]["dpop"])
+    _dpop = DPoPProof().verify_header(_http_info["headers"]["dpop"], _allowed_algs(context))
 
     # The signature of the JWS is verified, now for checking the
     # content
 
     if _dpop["htu"] != _http_info["url"].split("?")[0]:
         raise ValueError("htu in DPoP does not match the HTTP URI")
+    _check_iat(_dpop)
 
     if _dpop["htm"] != _http_info["method"]:
         raise ValueError("htm in DPoP does not match the HTTP method")
@@ -173,13 +202,12 @@ def userinfo_post_parse_request(request, client_id, context, auth_info, **kwargs
 
 
 def token_args(context, client_id, token_args: Optional[dict] = None):
-    dpop_jkt = context.cdb[client_id]["dpop_jkt"]
-    _jkt = list(dpop_jkt.keys())[0]
-    if "dpop_jkt" in context.cdb[client_id]:
+    dpop_jkt = context.cdb.get(client_id, {}).get("dpop_jkt")
+    if dpop_jkt:
+        _jkt = list(dpop_jkt.keys())[0] if isinstance(dpop_jkt, dict) else dpop_jkt
         if token_args is None:
-            token_args = {"cnf": {"jkt": _jkt}}
-        else:
-            token_args.update({"cnf": {"jkt": context.cdb[client_id]["dpop_jkt"]}})
+            token_args = {}
+        token_args["cnf"] = {"jkt": _jkt}
 
     return token_args
 
@@ -197,7 +225,7 @@ def add_support(endpoint: dict, **kwargs):
 
     _algs_supported = kwargs.get("dpop_signing_alg_values_supported")
     if not _algs_supported:
-        _algs_supported = ["RS256"]
+        _algs_supported = ["ES256"]
     else:
         _algs_supported = [alg for alg in _algs_supported if alg in get_signing_algs()]
 

@@ -512,7 +512,6 @@ class EudiwIssuer(object):
 
         url = kwargs["query"]
         query_params = parse_qs(url)
-        print("\nquery_params: ", query_params)
 
         """ args = {}
         if "authorization_details" in query_params:
@@ -536,8 +535,6 @@ class EudiwIssuer(object):
             "token": jws,
         }
         _resp.update(args) """
-
-        print("\nuser.py jws: ", jws)
 
         response = {"jws": jws}
 

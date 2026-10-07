@@ -1,8 +1,11 @@
 import os
+import time
+import uuid
 
 import pytest
 from cryptojwt.jwk.ec import ECKey
 from cryptojwt.jwk.ec import new_ec_key
+from cryptojwt.jws.jws import JWS
 from cryptojwt.jws.jws import factory
 from cryptojwt.key_jar import init_key_jar
 
@@ -31,6 +34,37 @@ DPOP_HEADER = (
 )
 
 
+def fresh_proof(htu="https://server.example.com/token", htm="POST", alg="ES256", key=None, iat=None):
+    """A DPoP proof made now (the static DPOP_HEADER is from 2019)."""
+    key = key or new_ec_key(crv="P-256")
+    _dpop = DPoPProof(
+        typ="dpop+jwt",
+        alg=alg,
+        jwk=key.serialize(),
+        jti=str(uuid.uuid4()),
+        htm=htm,
+        htu=htu,
+        iat=iat or int(time.time()),
+    )
+    _dpop.key = key
+    return _dpop.create_header()
+
+
+def test_verify_header_rejects_symmetric_key():
+    from cryptojwt.jwk.hmac import SYMKey
+
+    key = SYMKey(key="a-very-secret-shared-key-for-hmac", alg="HS256")
+    _payload = {"jti": "x", "htm": "POST", "htu": "https://server.example.com/token", "iat": int(time.time())}
+    _jws = JWS(_payload, alg="HS256").sign_compact(keys=[key], typ="dpop+jwt", jwk=key.serialize(private=True))
+    with pytest.raises(ValueError, match="public asymmetric"):
+        DPoPProof().verify_header(_jws)
+
+
+def test_verify_header_rejects_unsupported_alg():
+    with pytest.raises(ValueError, match="not supported"):
+        DPoPProof().verify_header(fresh_proof(), allowed_algs=["ES384"])
+
+
 def test_verify_header():
     _dpop = DPoPProof()
     assert _dpop.verify_header(DPOP_HEADER)
@@ -43,7 +77,7 @@ def test_verify_header():
 
     ec_key = new_ec_key(crv="P-256")
     _dpop2.key = ec_key
-    _dpop2["jwk"] = ec_key.to_dict()
+    _dpop2["jwk"] = ec_key.serialize()  # public part only: a private jwk is rejected
 
     _header = _dpop2.create_header()
 
@@ -228,13 +262,39 @@ class TestEndpoint(object):
             AUTH_REQ["client_id"],
             self.context,
             http_info={
-                "headers": {"dpop": DPOP_HEADER},
+                "headers": {"dpop": fresh_proof()},
                 "url": "https://server.example.com/token",
                 "method": "POST",
             },
         )
         assert auth_req
         assert "dpop_jkt" in auth_req
+
+    def test_post_parse_request_stale_proof(self):
+        with pytest.raises(ValueError, match="iat"):
+            token_post_parse_request(
+                AUTH_REQ,
+                AUTH_REQ["client_id"],
+                self.context,
+                http_info={
+                    "headers": {"dpop": fresh_proof(iat=int(time.time()) - 3600)},
+                    "url": "https://server.example.com/token",
+                    "method": "POST",
+                },
+            )
+
+    def test_post_parse_request_wrong_htu(self):
+        with pytest.raises(ValueError, match="htu"):
+            token_post_parse_request(
+                AUTH_REQ,
+                AUTH_REQ["client_id"],
+                self.context,
+                http_info={
+                    "headers": {"dpop": fresh_proof(htu="https://evil.example.com/token")},
+                    "url": "https://server.example.com/token",
+                    "method": "POST",
+                },
+            )
 
     def test_process_request(self):
         session_id = self._create_session(AUTH_REQ)
@@ -247,7 +307,7 @@ class TestEndpoint(object):
         _req = self.token_endpoint.parse_request(
             _token_request,
             http_info={
-                "headers": {"dpop": DPOP_HEADER},
+                "headers": {"dpop": fresh_proof()},
                 "url": "https://server.example.com/token",
                 "method": "POST",
             },
