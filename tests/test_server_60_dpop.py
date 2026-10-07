@@ -3,6 +3,7 @@ import time
 import uuid
 
 import pytest
+from cryptojwt import as_unicode
 from cryptojwt.jwk.ec import ECKey
 from cryptojwt.jwk.ec import new_ec_key
 from cryptojwt.jws.jws import JWS
@@ -17,6 +18,8 @@ from idpyoidc.server.authn_event import create_authn_event
 from idpyoidc.server.client_authn import verify_client
 from idpyoidc.server.configure import OPConfiguration
 from idpyoidc.server.oauth2.add_on.dpop import DPoPProof
+from idpyoidc.server.oauth2.add_on.dpop import DPoPErrorResponse
+from idpyoidc.server.oauth2.add_on.dpop import access_token_hash
 from idpyoidc.server.oauth2.add_on.dpop import token_post_parse_request
 from idpyoidc.server.oauth2.authorization import Authorization
 from idpyoidc.server.oidc.token import Token
@@ -270,31 +273,145 @@ class TestEndpoint(object):
         assert auth_req
         assert "dpop_jkt" in auth_req
 
+    def _parse(self, proof, url="https://server.example.com/token", method="POST"):
+        return token_post_parse_request(
+            AUTH_REQ.copy(),
+            AUTH_REQ["client_id"],
+            self.context,
+            http_info={"headers": {"dpop": proof}, "url": url, "method": method},
+        )
+
+    def _refused(self, result, reason):
+        assert isinstance(result, DPoPErrorResponse), result
+        assert result["error"] == "invalid_dpop_proof"
+        assert reason in result["error_description"]
+
     def test_post_parse_request_stale_proof(self):
-        with pytest.raises(ValueError, match="iat"):
-            token_post_parse_request(
-                AUTH_REQ,
-                AUTH_REQ["client_id"],
-                self.context,
-                http_info={
-                    "headers": {"dpop": fresh_proof(iat=int(time.time()) - 3600)},
-                    "url": "https://server.example.com/token",
-                    "method": "POST",
-                },
-            )
+        self._refused(self._parse(fresh_proof(iat=int(time.time()) - 3600)), "iat")
 
     def test_post_parse_request_wrong_htu(self):
-        with pytest.raises(ValueError, match="htu"):
-            token_post_parse_request(
-                AUTH_REQ,
-                AUTH_REQ["client_id"],
-                self.context,
-                http_info={
-                    "headers": {"dpop": fresh_proof(htu="https://evil.example.com/token")},
-                    "url": "https://server.example.com/token",
-                    "method": "POST",
-                },
-            )
+        self._refused(self._parse(fresh_proof(htu="https://evil.example.com/token")), "htu")
+
+    # NISCY fork: the checks the authorization server did itself (dpop.py) before.
+
+    def test_replayed_proof_is_refused(self):
+        proof = fresh_proof()
+        assert "dpop_jkt" in self._parse(proof)
+        self._refused(self._parse(proof), "already used")
+
+    def test_refused_proof_does_not_use_up_its_jti(self):
+        key = new_ec_key(crv="P-256")
+        jti = str(uuid.uuid4())
+
+        def proof(htm):
+            _dpop = DPoPProof(typ="dpop+jwt", alg="ES256", jwk=key.serialize(), jti=jti, htm=htm,
+                              htu="https://server.example.com/token", iat=int(time.time()))
+            _dpop.key = key
+            return _dpop.create_header()
+
+        self._refused(self._parse(proof("GET")), "htm")
+        assert "dpop_jkt" in self._parse(proof("POST"))
+
+    def test_typ_must_be_dpop_jwt(self):
+        key = new_ec_key(crv="P-256")
+        _dpop = DPoPProof(typ="jwt", alg="ES256", jwk=key.serialize(), jti=str(uuid.uuid4()), htm="POST",
+                          htu="https://server.example.com/token", iat=int(time.time()))
+        _dpop.key = key
+        self._refused(self._parse(_dpop.create_header()), "typ")
+
+    def test_iat_window(self):
+        assert "dpop_jkt" in self._parse(fresh_proof(iat=int(time.time()) + 30))
+        self._refused(self._parse(fresh_proof(iat=int(time.time()) + 120)), "iat")
+        assert "dpop_jkt" in self._parse(fresh_proof(iat=int(time.time()) - 200))
+
+    def test_configured_allowed_htu_is_used(self):
+        """Behind a proxy the request URL is internal: the proof names a public URL."""
+        self.context.add_on["dpop"]["allowed_htu"] = ["https://public.example.com/token"]
+        internal = "http://10.0.0.5:5000/token"
+        assert "dpop_jkt" in self._parse(fresh_proof(htu="https://public.example.com/token?x=1"), url=internal)
+        self._refused(self._parse(fresh_proof(htu=internal), url=internal), "htu")
+
+    def test_not_a_jws_is_refused(self):
+        self._refused(self._parse("not-a-jwt"), "")
+
+    def test_private_jwk_is_refused(self):
+        key = new_ec_key(crv="P-256")
+        _dpop = DPoPProof(typ="dpop+jwt", alg="ES256", jwk=key.serialize(private=True), jti=str(uuid.uuid4()),
+                          htm="POST", htu="https://server.example.com/token", iat=int(time.time()))
+        _dpop.key = key
+        self._refused(self._parse(_dpop.create_header()), "public asymmetric")
+
+    def test_proof_without_jti_is_refused(self):
+        key = new_ec_key(crv="P-256")
+        _payload = {"htm": "POST", "htu": "https://server.example.com/token", "iat": int(time.time())}
+        proof = JWS(_payload, alg="ES256").sign_compact(keys=[key], typ="dpop+jwt", jwk=key.serialize())
+        self._refused(self._parse(proof), "")
+
+    def test_access_token_hash_is_base64url(self):
+        import base64
+        import hashlib
+
+        expected = base64.urlsafe_b64encode(hashlib.sha256(b"tok").digest()).rstrip(b"=").decode()
+        assert access_token_hash("tok") == expected
+
+    def _offline_session(self):
+        auth_req = AUTH_REQ.copy()
+        auth_req["scope"] = ["openid", "offline_access"]
+        session_id = self._create_session(auth_req)
+        grant = self.session_manager[session_id]
+        return grant, self._mint_code(grant, auth_req["client_id"])
+
+    def _token(self, code, key):
+        _req = self.token_endpoint.parse_request(
+            {**TOKEN_REQ.to_dict(), "code": code.value},
+            http_info={"headers": {"dpop": fresh_proof(key=key)}, "url": "https://server.example.com/token",
+                       "method": "POST"},
+        )
+        return self.token_endpoint.process_request(request=_req)["response_args"]
+
+    def _refresh(self, refresh_token, key=None):
+        headers = {"dpop": fresh_proof(key=key)} if key else {}
+        _req = self.token_endpoint.parse_request(
+            {"grant_type": "refresh_token", "refresh_token": refresh_token, "client_id": "client_1",
+             "client_secret": "hemligt"},
+            http_info={"headers": headers, "url": "https://server.example.com/token", "method": "POST"},
+        )
+        return self.token_endpoint.process_request(request=_req)
+
+    def test_refresh_needs_the_bound_key(self):
+        key = new_ec_key(crv="P-256")
+        _, code = self._offline_session()
+        tokens = self._token(code, key)
+        assert tokens["token_type"] == "DPoP" and "refresh_token" in tokens
+
+        other = self._refresh(tokens["refresh_token"], new_ec_key(crv="P-256"))
+        assert isinstance(other, DPoPErrorResponse) and other["error"] == "invalid_dpop_proof"
+        without = self._refresh(tokens["refresh_token"])
+        assert isinstance(without, DPoPErrorResponse)
+        same = self._refresh(tokens["refresh_token"], key)
+        assert same["response_args"]["token_type"] == "DPoP"
+
+    def test_introspection_returns_the_bound_key(self):
+        from idpyoidc.server.oauth2.introspection import Introspection
+
+        introspection = Introspection(self.token_endpoint.upstream_get, enforce_audience_restriction=False)
+        key = new_ec_key(crv="P-256")
+        _, code = self._offline_session()
+        tokens = self._token(code, key)
+        info = introspection.process_request({"token": tokens["access_token"]})["response_args"]
+        assert info["active"] is True
+        assert info["cnf"] == {"jkt": as_unicode(key.thumbprint("SHA-256"))}
+
+    def test_introspection_of_a_bearer_token_has_no_cnf(self):
+        from idpyoidc.server.oauth2.introspection import Introspection
+
+        introspection = Introspection(self.token_endpoint.upstream_get, enforce_audience_restriction=False)
+        session_id = self._create_session(AUTH_REQ)
+        code = self._mint_code(self.session_manager[session_id], "client_1")
+        _req = self.token_endpoint.parse_request({**TOKEN_REQ.to_dict(), "code": code.value})
+        tokens = self.token_endpoint.process_request(request=_req)["response_args"]
+        info = introspection.process_request({"token": tokens["access_token"]})["response_args"]
+        assert info["active"] is True and "cnf" not in info
 
     def test_process_request(self):
         session_id = self._create_session(AUTH_REQ)
@@ -330,3 +447,25 @@ class TestEndpoint(object):
         )
         _token = self.session_manager.find_token(_session_info["branch_id"], access_token)
         assert _token.token_type == "DPoP"
+
+
+def test_jti_cache_accepts_a_proof_once_under_concurrency():
+    """NISCY fork: the same proof sent by many requests at once is accepted once."""
+    import threading
+
+    from idpyoidc.server.oauth2.add_on.dpop import JtiCache
+
+    cache = JtiCache()
+    barrier = threading.Barrier(20)
+    results = []
+
+    def add():
+        barrier.wait()
+        results.append(cache.add_once("jkt:jti", 60))
+
+    threads = [threading.Thread(target=add) for _ in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert results.count(True) == 1

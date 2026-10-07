@@ -1,4 +1,6 @@
+import base64
 import logging
+import threading
 import time
 from hashlib import sha256
 from typing import Callable
@@ -15,13 +17,16 @@ from idpyoidc.message import SINGLE_REQUIRED_INT
 from idpyoidc.message import SINGLE_REQUIRED_JSON
 from idpyoidc.message import SINGLE_REQUIRED_STRING
 from idpyoidc.message import Message
+from idpyoidc.message.oauth2 import TokenErrorResponse
 from idpyoidc.metadata import get_signing_algs
 from idpyoidc.server.client_authn import BearerHeader
 
 logger = logging.getLogger(__name__)
 
-#: Accepted distance (seconds) between a proof's iat and the server clock
+#: Accepted age (seconds) of a proof's iat
 DPOP_IAT_WINDOW = 300
+#: Accepted clock skew (seconds) of a proof's iat into the future
+DPOP_MAX_CLOCK_SKEW = 60
 #: JWK members that only a private or symmetric key has
 NON_PUBLIC_JWK_MEMBERS = {"d", "p", "q", "dp", "dq", "qi", "k"}
 
@@ -109,94 +114,167 @@ class DPoPProof(Message):
             return None
 
 
+class InvalidDPoPProof(ValueError):
+    """A DPoP proof that must be refused."""
+
+
+class DPoPErrorResponse(TokenErrorResponse):
+    """Token error response that also allows the RFC 9449 error codes."""
+
+    c_allowed_values = TokenErrorResponse.c_allowed_values.copy()
+    c_allowed_values["error"] = list(TokenErrorResponse.c_allowed_values["error"]) + [
+        "invalid_dpop_proof",
+        "use_dpop_nonce",
+    ]
+
+
+class JtiCache:
+    """Seen DPoP proofs (key thumbprint and ``jti``): each proof is accepted once.
+
+    Entries are kept for the acceptance window of ``iat``; an older proof is
+    refused for its age. The cache lives in this process: when several
+    processes serve the token endpoint, replace
+    ``context.add_on["dpop"]["jti_cache"]`` with one backed by a shared store
+    (same ``add_once`` method).
+    """
+
+    def __init__(self):
+        self._entries = {}
+        self._lock = threading.Lock()
+
+    def add_once(self, key: str, ttl: float) -> bool:
+        """Records ``key``; False when it was already recorded and has not expired."""
+        now = time.time()
+        with self._lock:
+            for _key in [k for k, exp in self._entries.items() if exp < now]:
+                del self._entries[_key]
+            if key in self._entries:
+                return False
+            self._entries[key] = now + ttl
+            return True
+
+
+#: Used when the add-on was not configured through add_support (unit tests)
+_DEFAULT_JTI_CACHE = JtiCache()
+
+
+def _dpop_conf(context) -> dict:
+    return (getattr(context, "add_on", {}) or {}).get("dpop") or {}
+
+
 def _allowed_algs(context):
-    return (getattr(context, "add_on", {}) or {}).get("dpop", {}).get("algs_supported")
+    return _dpop_conf(context).get("algs_supported")
 
 
-def _check_iat(dpop):
+def _strip_query(url: str) -> str:
+    return str(url).split("?", 1)[0].split("#", 1)[0]
+
+
+def _check_iat(dpop, now=None):
     _iat = dpop.get("iat")
-    if not isinstance(_iat, int) or abs(time.time() - _iat) > DPOP_IAT_WINDOW:
-        raise ValueError("DPoP 'iat' is outside the accepted window")
+    now = time.time() if now is None else now
+    if not isinstance(_iat, int) or _iat > now + DPOP_MAX_CLOCK_SKEW or _iat < now - DPOP_IAT_WINDOW:
+        raise InvalidDPoPProof("DPoP 'iat' is outside the accepted window")
+
+
+def access_token_hash(access_token: str) -> str:
+    """The ``ath`` of a proof for this access token (base64url SHA-256, RFC 9449 section 4.2)."""
+    digest = sha256(access_token.encode("utf8")).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def verify_proof(dpop_header: str, method: str, allowed_htu, context, access_token: Optional[str] = None):
+    """Validates a DPoP proof (RFC 9449 section 4.3).
+
+    Checks the signature with the proof's own public, asymmetric ``jwk`` and an
+    allowed ``alg``, ``typ`` = dpop+jwt, ``htm``, ``htu`` (one of
+    ``allowed_htu``, query and fragment ignored), the ``iat`` window, ``ath``
+    when an access token is given, and that the ``jti`` was not used before.
+
+    :return: (the proof, the RFC 7638 thumbprint of its key)
+    :raises InvalidDPoPProof: if any check fails
+    """
+    try:
+        _dpop = DPoPProof().verify_header(dpop_header, _allowed_algs(context))
+    except Exception as err:
+        raise InvalidDPoPProof(f"DPoP proof not verified: {err}") from err
+    if _dpop is None:
+        raise InvalidDPoPProof("DPoP proof is not a JWS")
+    if _dpop.get("typ") != "dpop+jwt":
+        raise InvalidDPoPProof("DPoP proof 'typ' must be dpop+jwt")
+    if _dpop.get("htm") != method:
+        raise InvalidDPoPProof("htm in DPoP does not match the HTTP method")
+    if _strip_query(_dpop.get("htu", "")) not in {_strip_query(u) for u in allowed_htu}:
+        raise InvalidDPoPProof("htu in DPoP does not match the HTTP URI")
+    _check_iat(_dpop)
+    if access_token is not None and _dpop.get("ath") != access_token_hash(access_token):
+        raise InvalidDPoPProof("'ath' in DPoP does not match the token hash")
+    _jti = _dpop.get("jti")
+    if not isinstance(_jti, str) or not _jti:
+        raise InvalidDPoPProof("DPoP proof has no 'jti'")
+
+    if not _dpop.key:
+        _dpop.key = key_from_jwk_dict(_dpop["jwk"])
+    _jkt = as_unicode(_dpop.key.thumbprint("SHA-256"))
+    _cache = _dpop_conf(context).get("jti_cache") or _DEFAULT_JTI_CACHE
+    # Last, so that a proof refused for another reason does not use up its jti.
+    if not _cache.add_once(f"{_jkt}:{_jti}", DPOP_IAT_WINDOW + DPOP_MAX_CLOCK_SKEW):
+        raise InvalidDPoPProof("DPoP proof 'jti' already used")
+    return _dpop, _jkt
 
 
 def token_post_parse_request(request, client_id, context, **kwargs):
     """
-    Expect http_info attribute in kwargs. http_info should be a dictionary
-    containing HTTP information.
+    Validates the DPoP proof of a token request, if there is one, and records
+    its key thumbprint as ``dpop_jkt`` (the grant and its tokens are bound to it).
 
-    :param request:
-    :param client_id:
-    :param context:
-    :param kwargs:
-    :return:
+    Expects ``http_info`` (headers, method, URL) in kwargs. The proof's ``htu``
+    must be one of the configured ``allowed_htu`` (the public token endpoint
+    URLs), or the request URL when none are configured.
+
+    :return: the request, or a DPoPErrorResponse (invalid_dpop_proof)
     """
 
     _http_info = kwargs.get("http_info")
     if not _http_info:
         return request
 
-    if "dpop" not in _http_info["headers"]:
+    _header = (_http_info.get("headers") or {}).get("dpop")
+    if not _header:
         return request
 
-    _dpop = DPoPProof().verify_header(_http_info["headers"]["dpop"], _allowed_algs(context))
-
-    # The signature of the JWS is verified, now for checking the
-    # content
-    allowed_htu = kwargs.get("allowed_htu") or [_http_info.get("url", "").split("?")[0]]
-
-    if _dpop.get("htu") not in allowed_htu:
-        raise ValueError("htu in DPoP does not match the HTTP URI")
-    _check_iat(_dpop)
-
-    if _dpop["htm"] != _http_info["method"]:
-        raise ValueError("htm in DPoP does not match the HTTP method")
-
-    if not _dpop.key:
-        _dpop.key = key_from_jwk_dict(_dpop["jwk"])
+    allowed_htu = _dpop_conf(context).get("allowed_htu") or kwargs.get("allowed_htu") or [_http_info.get("url", "")]
+    try:
+        _, _jkt = verify_proof(_header, _http_info.get("method"), allowed_htu, context)
+    except InvalidDPoPProof as err:
+        logger.warning("DPoP proof refused: %s", err)
+        return DPoPErrorResponse(error="invalid_dpop_proof", error_description=str(err))
 
     # Need something I can add as a reference when minting tokens
-    request["dpop_jkt"] = as_unicode(_dpop.key.thumbprint("SHA-256"))
+    request["dpop_jkt"] = _jkt
     return request
 
 
 def userinfo_post_parse_request(request, client_id, context, auth_info, **kwargs):
     """
-    Expect http_info attribute in kwargs. http_info should be a dictionary
-    containing HTTP information.
+    Validates the DPoP proof sent with a DPoP-bound access token (including
+    ``ath``) and records its key thumbprint as ``dpop_jkt``.
 
-    :param request:
-    :param client_id:
-    :param context:
-    :param kwargs:
-    :return:
+    :raises InvalidDPoPProof: if the proof is invalid
     """
 
     _http_info = kwargs.get("http_info")
     if not _http_info:
         return request
 
-    _dpop = DPoPProof().verify_header(_http_info["headers"]["dpop"], _allowed_algs(context))
-
-    # The signature of the JWS is verified, now for checking the
-    # content
-
-    if _dpop["htu"] != _http_info["url"].split("?")[0]:
-        raise ValueError("htu in DPoP does not match the HTTP URI")
-    _check_iat(_dpop)
-
-    if _dpop["htm"] != _http_info["method"]:
-        raise ValueError("htm in DPoP does not match the HTTP method")
-
-    if not _dpop.key:
-        _dpop.key = key_from_jwk_dict(_dpop["jwk"])
-
-    ath = sha256(auth_info["token"].encode("utf8")).hexdigest()
-
-    if _dpop["ath"] != ath:
-        raise ValueError("'ath' in DPoP does not match the token hash")
-
-    # Need something I can add as a reference when minting tokens
-    request["dpop_jkt"] = as_unicode(_dpop.key.thumbprint("SHA-256"))
+    _, _jkt = verify_proof(
+        _http_info["headers"]["dpop"],
+        _http_info["method"],
+        [_http_info["url"]],
+        context,
+        access_token=auth_info["token"],
+    )
+    request["dpop_jkt"] = _jkt
     logger.debug("DPoP verified")
     return request
 
@@ -204,7 +282,7 @@ def userinfo_post_parse_request(request, client_id, context, auth_info, **kwargs
 def token_args(context, client_id, token_args: Optional[dict] = None):
     dpop_jkt = context.cdb.get(client_id, {}).get("dpop_jkt")
     if dpop_jkt:
-        _jkt = list(dpop_jkt.keys())[0] if isinstance(dpop_jkt, dict) else dpop_jkt
+        _jkt = next(iter(dpop_jkt.keys())) if isinstance(dpop_jkt, dict) else dpop_jkt
         if token_args is None:
             token_args = {}
         token_args["cnf"] = {"jkt": _jkt}
@@ -231,7 +309,12 @@ def add_support(endpoint: dict, **kwargs):
 
     _context = token_endpoint.upstream_get("context")
     _context.provider_info["dpop_signing_alg_values_supported"] = _algs_supported
-    _context.add_on["dpop"] = {"algs_supported": _algs_supported}
+    _context.add_on["dpop"] = {
+        "algs_supported": _algs_supported,
+        # Public URLs of the token endpoint a proof's htu may name
+        "allowed_htu": list(kwargs.get("allowed_htu") or []),
+        "jti_cache": JtiCache(),
+    }
     _context.client_authn_methods["dpop"] = DPoPClientAuth(BearerHeader)
 
     for _dpop_endpoint in kwargs.get("dpop_endpoints", ["userinfo"]):

@@ -180,3 +180,38 @@ class TestPublicClientWithDpop:
 
     def test_authorization_header_excludes_public(self):
         assert not self._usable({"Authorization": "Basic x"})
+
+
+class TestJarEncryptionSettings:
+    """Unsupported request object encryption was silently ignored (the
+    AttributeError was created, not raised)."""
+
+    class _Service:
+        def __init__(self):
+            self.post_construct = []
+
+        def upstream_get(self, what):
+            from types import SimpleNamespace
+
+            return SimpleNamespace(add_on={})
+
+    @pytest.mark.parametrize(
+        "alg, enc",
+        [("not-an-alg", "A128GCM"), ("ECDH-ES", "not-an-enc")],
+    )
+    def test_unsupported_encryption_is_refused(self, alg, enc):
+        from idpyoidc.client.oauth2.add_on import jar
+
+        with pytest.raises(AttributeError):
+            jar.add_support({"authorization": self._Service()}, request_object_encryption_alg=alg,
+                            request_object_encryption_enc=enc)
+
+    def test_supported_encryption_is_kept(self):
+        from idpyoidc.client.oauth2.add_on import jar
+
+        service = self._Service()
+        context = service.upstream_get("context")
+        service.upstream_get = lambda what: context
+        jar.add_support({"authorization": service}, request_object_encryption_alg="ECDH-ES",
+                        request_object_encryption_enc="A128GCM")
+        assert context.add_on["jar"]["request_object_encryption_alg"] == "ECDH-ES"

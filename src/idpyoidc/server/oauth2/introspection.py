@@ -78,6 +78,12 @@ class Introspection(Endpoint):
         if aud:
             ret["aud"] = aud
 
+        # RFC 9449 section 6.2: the resource server checks the proof key of a
+        # DPoP-bound access token against cnf.jkt.
+        _jkt = grant.extra.get("dpop_jkt")
+        if _jkt and token.token_class == "access_token":
+            ret["cnf"] = {"jkt": _jkt}
+
         token_args = {}
         for meth in _context.token_args_methods:
             token_args = meth(_context, client_id, token_args)

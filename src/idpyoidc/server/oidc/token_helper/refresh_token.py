@@ -39,6 +39,16 @@ class RefreshTokenHelper(TokenEndpointHelper):
 
         _grant = _session_info["grant"]
 
+        # A grant bound to a DPoP key (RFC 9449 section 5) is refreshed only with
+        # a proof from that key; it can not be re-bound or downgraded to Bearer.
+        _bound_jkt = _grant.extra.get("dpop_jkt")
+        if _bound_jkt and req.get("dpop_jkt") != _bound_jkt:
+            from idpyoidc.server.oauth2.add_on.dpop import DPoPErrorResponse
+
+            return DPoPErrorResponse(
+                error="invalid_dpop_proof", error_description="DPoP key differs from the bound key"
+            )
+
         token_type = "Bearer"
 
         # Is DPOP supported

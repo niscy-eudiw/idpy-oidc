@@ -37,7 +37,7 @@ LOC = {
     "se": {
         "title": "Logga in",
         "login_title": "Användarnamn",
-        "passwd_title": "Lösenord",
+        "passwd_title": "Lösenord",  # NOSONAR - translated form label, not a credential
         "submit_text": "Sänd",
         "client_policy_title": "Klientens sekretesspolicy",
     },

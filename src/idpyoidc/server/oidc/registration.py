@@ -68,7 +68,7 @@ def verify_url(url: str, urlset: List[list]) -> bool:
 
 def secret(seed: str, sid: str):
     msg = "{}{}{}".format(utc_time_sans_frac(), secrets.token_urlsafe(16), sid).encode("utf-8")
-    csum = hmac.new(as_bytes(seed), msg, hashlib.sha224)
+    csum = hmac.new(as_bytes(seed), msg, hashlib.sha256)
     return csum.hexdigest()
 
 
