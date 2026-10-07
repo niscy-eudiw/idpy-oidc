@@ -22,3 +22,20 @@
 - Malformed attestations, a missing `x5c` or `client_id`, or missing `http_info` raised errors that became 500s instead of authentication errors.
 - `token_args` (DPoP) raised `KeyError` for clients without a DPoP key; the token endpoint `kwargs` lookup raised `KeyError` when the endpoint had none.
 - Removed `print` calls that wrote client attestations, tokens, request headers and the authentication JWS to stdout; the raw WIA and PoP are no longer logged.
+
+## Unreleased
+
+### Changed
+- CI: `python-app.yml` replaced by `tests.yml` (Python 3.12/3.13, pinned actions); Gitleaks, Dependency-Check and SonarCloud workflows added. `pytest-black` removed from `requirements-dev.txt` (it cannot load under pytest 9). `JWTToken` logs a missing session instead of a silent `try/except/pass`.
+- PKCE add-on: `code_challenge_methods` also takes a list of method names (JSON configuration); the misspelt `code_challenge_method` option is refused at start-up instead of being ignored (which allowed every method, `plain` included). The check also runs on pushed authorization requests. A client's `pkce_essential` can only make PKCE stricter. The server can skip it for its own pre-authorized code request (`pre_authorized_code=True` parse argument).
+- `EudiwIssuer`: the authentication hand-off JWT has a lifetime (`token_lifetime`, default 1800 s) and `unpack_token` accepts it only signed by this server (`iss`), with its algorithm, and with `exp`.
+- The access token's `client_status` comes from the wallet attestation verified in the current request (`client_authn.VERIFIED_CLIENT_STATUS`), not from the client database entry other wallet instances with the same `client_id` share.
+- `BearerHeader` no longer takes the client id from the request (and no longer raises `KeyError` without one): it is the client the token was issued to.
+- `PublicAuthn` accepts a request that carries a DPoP proof: DPoP is not client authentication (RFC 9449), so a public client could not use DPoP-bound tokens. Requests with wallet attestation or `Authorization` headers are still not treated as public.
+
+### Fixed
+- `util.sanitize` returned its input unchanged, so codes, `code_verifier`s, tokens and client secrets were logged; it now redacts them (dicts, Messages and strings) and escapes line breaks. Registration logs `ClientInfo` through it.
+
+### Tests
+- `tests/test_niscy_hardening.py` covers the changes above.
+- `tests/conftest.py` lists the upstream tests that fail because of intentional fork changes (re-authentication on every request, introspection for the issuer backend, refresh tokens, optional scope) as strict xfails with the reason; 2 are marked as not yet triaged.

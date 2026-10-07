@@ -480,7 +480,7 @@ class Registration(Endpoint):
             self.upstream_get("attribute", "keyjar").add_symmetric(client_id, str(client_secret))
 
         logger.debug("Stored updated client info in CDB under cid={}".format(client_id))
-        logger.debug("ClientInfo: {}".format(_cinfo))
+        logger.debug("ClientInfo: {}".format(sanitize(_cinfo)))
         _context.cdb[client_id] = _cinfo
 
         # Not all databases can be sync'ed
@@ -566,7 +566,7 @@ class Registration(Endpoint):
             self.upstream_get("attribute", "keyjar").add_symmetric(client_id, str(client_secret))
 
         logger.debug("Stored updated client info in CDB under cid={}".format(client_id))
-        logger.info("ClientInfo: {}".format(_cinfo))
+        logger.info("ClientInfo: {}".format(sanitize(_cinfo)))
         _context.cdb[client_id] = _cinfo
 
         # Not all databases can be sync'ed

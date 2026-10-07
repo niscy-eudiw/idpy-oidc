@@ -14,6 +14,7 @@ from ...session import MintingNotAllowed
 from ...session.token import AuthorizationCode
 from ...token import UnknownToken
 from . import TokenEndpointHelper
+from . import redemption_lock
 from . import validate_resource_indicators_policy
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,11 @@ logger = logging.getLogger(__name__)
 
 class AccessTokenHelper(TokenEndpointHelper):
     def process_request(self, req: Union[Message, dict], **kwargs):
+        """Redeems an authorization code, one request per code at a time."""
+        with redemption_lock(req.get("code")):
+            return self._redeem_code(req, **kwargs)
+
+    def _redeem_code(self, req: Union[Message, dict], **kwargs):
         """
 
         :param req:
@@ -81,6 +87,10 @@ class AccessTokenHelper(TokenEndpointHelper):
                 token_type = "DPoP"
 
         _based_on = grant.get_token(_access_code)
+        # Checked again under the redemption lock: a concurrent request may
+        # have used the code since post_parse_request.
+        if not _based_on.is_active():
+            return self.error_cls(error="invalid_grant", error_description="Code inactive")
         _supports_minting = _based_on.usage_rules.get("supports_minting", [])
 
         _authn_req = grant.authorization_request

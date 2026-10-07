@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import time
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Callable, Dict, Optional, Union
 
@@ -34,6 +35,11 @@ from idpyoidc.server.exception import (
 from idpyoidc.util import importer, sanitize
 
 logger = logging.getLogger(__name__)
+
+#: client_status of the wallet attestation verified in the current request.
+#: Tokens take it from here, not from the client database entry, which
+#: concurrent requests of other wallet instances with the same client_id share.
+VERIFIED_CLIENT_STATUS: ContextVar = ContextVar("verified_client_status", default=None)
 
 __author__ = "roland hedberg"
 
@@ -149,12 +155,14 @@ class PublicAuthn(ClientAuthnMethod):
         if http_info is not None:
             _headers = http_info.get("headers", {})
             header_keys = {k.lower() for k in _headers}
+            # A request carrying credentials of another method is not public.
+            # A DPoP proof is not client authentication (RFC 9449): public
+            # clients send one too.
             if any(
                 h in header_keys
                 for h in (
                     "oauth-client-attestation",
                     "oauth-client-attestation-pop",
-                    "dpop",
                     "authorization",
                 )
             ):
@@ -257,7 +265,9 @@ class BearerHeader(ClientSecretBasic):
         logger.debug(f"Client Auth method: {self.tag}")
         token = authorization_token.split(" ", 1)[1]
         _context = self.upstream_get("context")
-        client_id = request["client_id"]
+        # The client is the one the token was issued to, never a client_id
+        # named in the request.
+        client_id = ""
         if get_client_id_from_token:
             try:
                 client_id = get_client_id_from_token(_context, token, request)
@@ -868,6 +878,7 @@ class ClientAuthenticationAttestation(ClientAuthnMethod):
             if _val:
                 _c_info[key] = _val
         oas.context.cdb[client_id] = _c_info
+        VERIFIED_CLIENT_STATUS.set(_wia.get("client_status"))
 
         return {"client_id": client_id, "jwt": _wia}
 
@@ -954,6 +965,7 @@ def verify_client(
     :return: dictionary containing client id, client authentication method and
         possibly access token.
     """
+    VERIFIED_CLIENT_STATUS.set(None)
 
     if http_info and "headers" in http_info:
         authorization_token = http_info["headers"].get("authorization")
