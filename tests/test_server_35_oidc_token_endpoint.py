@@ -317,6 +317,48 @@ class TestEndpoint(_TestEndpoint):
         _2nd_response = self.token_endpoint.parse_request(_token_request)
         assert "error" in _2nd_response
 
+    # NISCY fork: a code is redeemed once even when requests overlap.
+
+    def test_code_parsed_twice_is_redeemed_once(self):
+        session_id = self._create_session(AUTH_REQ)
+        grant = self.session_manager[session_id]
+        code = self._mint_code(grant, AUTH_REQ["client_id"])
+        _token_request = {**TOKEN_REQ_DICT, "code": code.value}
+
+        # Both pass parsing (the code is still unused), as concurrent requests do.
+        first = self.token_endpoint.parse_request(_token_request)
+        second = self.token_endpoint.parse_request(_token_request)
+        assert "access_token" in self.token_endpoint.process_request(request=first)["response_args"]
+
+        # An error is returned as such, a success inside "response_args".
+        _resp = self.token_endpoint.process_request(request=second)
+        assert _resp["error"] == "invalid_grant"
+
+    def test_concurrent_redemptions_mint_one_token(self):
+        import threading
+
+        session_id = self._create_session(AUTH_REQ)
+        grant = self.session_manager[session_id]
+        code = self._mint_code(grant, AUTH_REQ["client_id"])
+        _token_request = {**TOKEN_REQ_DICT, "code": code.value}
+        requests = [self.token_endpoint.parse_request(_token_request) for _ in range(8)]
+        barrier = threading.Barrier(len(requests))
+        results = []
+
+        def redeem(req):
+            barrier.wait()
+            _resp = self.token_endpoint.process_request(request=req)
+            results.append(_resp.get("response_args", _resp))
+
+        threads = [threading.Thread(target=redeem, args=(r,)) for r in requests]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert sum("access_token" in r for r in results) == 1
+        assert sum(r.get("error") == "invalid_grant" for r in results) == len(requests) - 1
+
     def test_do_response(self):
         session_id = self._create_session(AUTH_REQ)
         grant = self.session_manager[session_id]

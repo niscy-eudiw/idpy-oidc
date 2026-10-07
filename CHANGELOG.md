@@ -25,6 +25,9 @@
 
 ## Unreleased
 
+### Fixed
+- Authorization code redemption: concurrent token requests with one code all passed the "code unused" check before any marked it used, and each got an access token. `AccessTokenHelper.process_request` (oauth2 and oidc) now redeems a code under a per-code lock (`token_helper.redemption_lock`, 64 striped locks) and checks it again under that lock (`invalid_grant`). Sessions are in process memory, so this covers one server process. Tests: `test_code_parsed_twice_is_redeemed_once`, `test_concurrent_redemptions_mint_one_token`.
+
 ### Changed
 - CI: `python-app.yml` replaced by `tests.yml` (Python 3.12/3.13, pinned actions); Gitleaks, Dependency-Check and SonarCloud workflows added. `pytest-black` removed from `requirements-dev.txt` (it cannot load under pytest 9). `JWTToken` logs a missing session instead of a silent `try/except/pass`.
 - PKCE add-on: `code_challenge_methods` also takes a list of method names (JSON configuration); the misspelt `code_challenge_method` option is refused at start-up instead of being ignored (which allowed every method, `plain` included). The check also runs on pushed authorization requests. A client's `pkce_essential` can only make PKCE stricter. The server can skip it for its own pre-authorized code request (`pre_authorized_code=True` parse argument).
