@@ -806,12 +806,15 @@ class ClientAuthenticationAttestation(ClientAuthnMethod):
             raise ClientAuthenticationError("No trusted attester certificates found")
         return trusted_attesters
 
-    def _audiences(self, endpoint) -> list:
-        """What the PoP 'aud' may be: this server's issuer identifier, or the endpoint URL."""
+    def _audiences(self, endpoint, pop_allowed_aud=None) -> list:
+        """What the PoP 'aud' may be: this server's issuer identifier, the endpoint URL, or
+        one of ``pop_allowed_aud`` (the issuer identifiers of the frontends that relay
+        requests here and publish their own authorization server metadata)."""
         _context = topmost_unit(self).context
         _aud = [getattr(_context, "issuer", None)]
         if endpoint is not None:
             _aud.append(getattr(endpoint, "full_path", None))
+        _aud.extend(pop_allowed_aud or [])
         return [a for a in _aud if a]
 
     def _verify(
@@ -857,7 +860,7 @@ class ClientAuthenticationAttestation(ClientAuthnMethod):
             status_validator_url=kwargs.get("status_validator_url"),
             skip_client_id_check=bool(kwargs.get("skip_client_id_check")),
         )
-        self.verify_pop(_wia=_wia, _pop_raw=pop_raw, audiences=self._audiences(endpoint))
+        self.verify_pop(_wia=_wia, _pop_raw=pop_raw, audiences=self._audiences(endpoint, kwargs.get("pop_allowed_aud")))
 
         client_id = request.get("client_id") or _wia["sub"]
 

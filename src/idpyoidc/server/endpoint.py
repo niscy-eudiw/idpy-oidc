@@ -228,7 +228,7 @@ class Endpoint(Node):
 
         # Wallet attestation (client authentication) settings, configured on the token endpoint
         _token_kwargs = conf.get("endpoint", {}).get("token", {}).get("kwargs") or {}
-        for _name in ("trusted_attesters_path", "trust_validator_url", "status_validator_url"):
+        for _name in ("trusted_attesters_path", "trust_validator_url", "status_validator_url", "pop_allowed_aud"):
             if _name in _token_kwargs:
                 kwargs[_name] = _token_kwargs[_name]
 

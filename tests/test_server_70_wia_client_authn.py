@@ -247,6 +247,21 @@ def test_pop_audience_trailing_slash(method, pki, anchors):
     assert authenticate(method, make_wia(pki), make_pop(pki, aud=ISSUER + "/"), trusted_attesters_path=anchors)
 
 
+def test_pop_audience_configured_frontend(method, pki, anchors):
+    frontends = ["https://frontend.example.com"]
+    pop = make_pop(pki, aud="https://frontend.example.com")
+    res = authenticate(method, make_wia(pki), pop, trusted_attesters_path=anchors, pop_allowed_aud=frontends)
+    assert res["client_id"] == CLIENT_ID
+
+
+def test_pop_audience_unlisted_frontend(method, pki, anchors):
+    pop = make_pop(pki, aud="https://other-frontend.example.com")
+    with pytest.raises(ClientAuthenticationError, match="'aud'"):
+        authenticate(
+            method, make_wia(pki), pop, trusted_attesters_path=anchors, pop_allowed_aud=["https://frontend.example.com"]
+        )
+
+
 def test_pop_wrong_issuer(method, pki, anchors):
     with pytest.raises(ClientAuthenticationError, match="'iss'"):
         authenticate(method, make_wia(pki), make_pop(pki, iss="someone-else"), trusted_attesters_path=anchors)
