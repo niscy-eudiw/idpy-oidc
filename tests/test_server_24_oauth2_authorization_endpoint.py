@@ -328,7 +328,8 @@ class TestEndpoint(object):
         msg = ""
         _pr_resp = self.endpoint.parse_request(_orig_req)
         assert isinstance(_pr_resp, AuthorizationErrorResponse)
-        assert _pr_resp["error"] == "invalid_request"
+        # RFC 6749 section 4.1.2.1: the server does not support "code token"
+        assert _pr_resp["error"] == "unsupported_response_type"
 
     def test_verify_uri_unknown_client(self):
         request = {"redirect_uri": "https://rp.example.com/cb"}

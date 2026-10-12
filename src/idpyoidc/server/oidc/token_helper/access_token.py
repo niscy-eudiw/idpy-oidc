@@ -12,6 +12,7 @@ from idpyoidc.server.oauth2.token_helper import redemption_lock
 from idpyoidc.server.session.token import AuthorizationCode
 from idpyoidc.server.session.token import MintingNotAllowed
 from idpyoidc.server.token.exception import UnknownToken
+from idpyoidc.server.token.exception import WrongTokenClass
 from idpyoidc.util import sanitize
 
 logger = logging.getLogger(__name__)
@@ -96,9 +97,15 @@ class AccessTokenHelper(TokenEndpointHelper):
         # If redirect_uri was in the initial authorization request
         # verify that the one given here is the correct one.
         if "redirect_uri" in _authn_req:
+            # RFC 6749 section 4.1.3: then it is required and must be identical;
+            # a mismatch is invalid_grant (section 5.2).
+            if "redirect_uri" not in req:
+                return self.error_cls(
+                    error="invalid_request", error_description="Missing redirect_uri"
+                )
             if req["redirect_uri"] != _authn_req["redirect_uri"]:
                 return self.error_cls(
-                    error="invalid_request", error_description="redirect_uri mismatch"
+                    error="invalid_grant", error_description="redirect_uri mismatch"
                 )
 
         logger.debug("All checks OK")
@@ -193,19 +200,24 @@ class AccessTokenHelper(TokenEndpointHelper):
         :returns:
         """
 
+        # RFC 6749 section 5.2: a missing parameter is invalid_request, a code
+        # that is unknown, expired, used or of the wrong kind is invalid_grant.
+        if not request.get("code"):
+            return self.error_cls(error="invalid_request", error_description="Missing code")
+
         _mngr = self.endpoint.upstream_get("context").session_manager
         try:
             _session_info = _mngr.get_session_info_by_token(
                 request["code"], grant=True, handler_key="authorization_code"
             )
-        except (KeyError, UnknownToken):
+        except (KeyError, UnknownToken, WrongTokenClass):
             logger.error("Access Code invalid")
             return self.error_cls(error="invalid_grant", error_description="Unknown code")
 
         grant = _session_info["grant"]
         code = grant.get_token(request["code"])
         if not isinstance(code, AuthorizationCode):
-            return self.error_cls(error="invalid_request", error_description="Wrong token type")
+            return self.error_cls(error="invalid_grant", error_description="Wrong token type")
 
         if code.used:  # Has been used already
             # invalidate all tokens that has been minted using this code
