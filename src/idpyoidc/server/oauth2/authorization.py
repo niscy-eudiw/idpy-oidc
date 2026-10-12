@@ -370,6 +370,69 @@ class Authorization(Endpoint):
         self.allowed_request_algorithms = AllowedAlgorithms(ALG_PARAMS)
         self.resource_indicators_config = kwargs.get("resource_indicators", None)
 
+    #: Whether a request_uri from a pushed authorization request is resolved here
+    resolves_pushed_requests = True
+
+    def parse_request(
+        self,
+        request: Union[Message, dict, str],
+        http_info: Optional[dict] = None,
+        verify_args: Optional[dict] = None,
+        **kwargs,
+    ):
+        """Parses an authorization request, the pushed one when it names a
+        request_uri from the pushed authorization endpoint.
+
+        RFC 9126 section 4: the request then only needs client_id and
+        request_uri, so the pushed request replaces it before it is verified.
+        """
+        if self.resolves_pushed_requests:
+            _pushed = self._pushed_request(request)
+            if isinstance(_pushed, self.error_cls):
+                return _pushed
+            if _pushed is not None:
+                request = _pushed
+        return Endpoint.parse_request(self, request, http_info=http_info, verify_args=verify_args, **kwargs)
+
+    def _pushed_request(self, request):
+        """The pushed request a request_uri names (single use, RFC 9126 section 4).
+
+        :return: the pushed request, an error response (unknown, used or
+            expired request_uri, or another client_id), or None if the request
+            does not name a pushed request
+        """
+        if isinstance(request, str):
+            if self.request_format != "urlencoded":
+                return None
+            request = Message().from_urlencoded(request)
+        elif not isinstance(request, (dict, Message)):
+            return None
+
+        _request_uri = request.get("request_uri")
+        if not isinstance(_request_uri, str) or not _request_uri.startswith("urn:uuid:"):
+            return None
+        _endp = self.upstream_get("endpoint", "pushed_authorization")
+        if not _endp:
+            return None
+
+        _req = self.upstream_get("context").par_db.pop(_request_uri, None)  # One time usage
+        if _req is None or _endp.is_expired(_request_uri):
+            # RFC 9126 section 4 and RFC 9101 section 7: invalid_request_uri
+            return self.authentication_error_response(
+                request,
+                error="invalid_request_uri",
+                error_description="Unknown, used or expired request_uri",
+            )
+        # RFC 9126 section 2.2: bound to the client that pushed it; RFC 9101
+        # section 5: client_id is required alongside it.
+        if request.get("client_id") != _req.get("client_id"):
+            return self.authentication_error_response(
+                request,
+                error="invalid_request",
+                error_description="client_id does not match the pushed authorization request",
+            )
+        return _req
+
     def filter_request(self, context, req):
         return req
 
@@ -429,21 +492,16 @@ class Authorization(Endpoint):
     def _do_request_uri(self, request, client_id, context, **kwargs):
         _request_uri = request.get("request_uri")
         if _request_uri:
-            # Do I do pushed authorization requests ?
-            _endp = self.upstream_get("endpoint", "pushed_authorization")
-            if _endp:
-                # Is it a UUID urn
-                if _request_uri.startswith("urn:uuid:"):
-                    _req = context.par_db.pop(_request_uri, None)  # One time usage
-                    if _req and not _endp.is_expired(_request_uri):
-                        return _req
-                    # RFC 9126 section 4 (unknown, used or expired) and
-                    # RFC 9101 section 7: invalid_request_uri
-                    return self.authentication_error_response(
-                        request,
-                        error="invalid_request_uri",
-                        error_description="Unknown, used or expired request_uri",
-                    )
+            # A pushed request's URI is resolved by parse_request, before
+            # verification; one left here was not, and is never fetched.
+            if _request_uri.startswith("urn:uuid:") and self.upstream_get(
+                "endpoint", "pushed_authorization"
+            ):
+                return self.authentication_error_response(
+                    request,
+                    error="invalid_request_uri",
+                    error_description="Unknown, used or expired request_uri",
+                )
 
             # Do I support request_uri ?
             if context.provider_info.get("request_uri_parameter_supported", True) is False:

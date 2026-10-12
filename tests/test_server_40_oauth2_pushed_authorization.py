@@ -258,3 +258,34 @@ class TestEndpoint(object):
         _req = self.authorization_endpoint.parse_request(_msg)
 
         assert "code_challenge" in _req
+
+    def _pushed_request_uri(self):
+        http_info = {
+            "headers": {"authorization": "Basic czZCaGRSa3F0Mzo3RmpmcDBaQnIxS3REUmJuZlZkbUl3"}
+        }
+        _req = self.pushed_authorization_endpoint.parse_request(AUTHN_REQUEST, http_info=http_info)
+        return self.pushed_authorization_endpoint.process_request(_req)["http_response"]["request_uri"]
+
+    def test_authorization_with_only_client_id_and_request_uri(self):
+        # RFC 9126 section 4: the pushed request supplies everything else.
+        _uri = self._pushed_request_uri()
+        _req = self.authorization_endpoint.parse_request({"client_id": "s6BhdRkqt3", "request_uri": _uri})
+        assert isinstance(_req, AuthorizationRequest)
+        assert _req["response_type"] == ["code"]
+        assert "code_challenge" in _req
+
+    def test_authorization_with_only_request_uri_urlencoded(self):
+        _uri = self._pushed_request_uri()
+        _req = self.authorization_endpoint.parse_request(f"client_id=s6BhdRkqt3&request_uri={_uri}")
+        assert isinstance(_req, AuthorizationRequest)
+
+    def test_request_uri_of_another_client(self):
+        _uri = self._pushed_request_uri()
+        _req = self.authorization_endpoint.parse_request({"client_id": "other", "request_uri": _uri})
+        assert _req["error"] == "invalid_request"
+
+    def test_request_uri_is_single_use(self):
+        _uri = self._pushed_request_uri()
+        self.authorization_endpoint.parse_request({"client_id": "s6BhdRkqt3", "request_uri": _uri})
+        _req = self.authorization_endpoint.parse_request({"client_id": "s6BhdRkqt3", "request_uri": _uri})
+        assert _req["error"] == "invalid_request_uri"

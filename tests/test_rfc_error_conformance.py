@@ -471,19 +471,12 @@ class TestTokenEndpoint:
         _refresh = self._refresh_token(new_ec_key(crv="P-256"))
         assert_error(self._token(self._refresh_request(_refresh)), "invalid_dpop_proof")
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="RFC 9449 section 10: a code bound with dpop_jkt in the authorization "
-        "request must be refused when the token request proof uses another key; the "
-        "dpop_jkt authorization parameter is not checked at the token endpoint",
-    )
     def test_code_bound_with_dpop_jkt_refuses_other_key(self):
         key = new_ec_key(crv="P-256")
         _areq = AUTH_REQ.copy()
         _areq["dpop_jkt"] = key.thumbprint("SHA-256").decode()
         _, code = self._code(_areq)
-        _resp = self._token(self._token_request(code), http_info(dpop_proof()))
-        assert isinstance(_resp, ResponseMessage) and "error" in _resp
+        assert_error(self._token(self._token_request(code), http_info(dpop_proof())), "invalid_dpop_proof")
 
     # --- client authentication (RFC 6749 sections 2.3 and 5.2) ------------
 

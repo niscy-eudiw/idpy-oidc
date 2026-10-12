@@ -19,6 +19,8 @@ class PushedAuthorization(Authorization):
     response_format = "json"
     name = "pushed_authorization"
     endpoint_type = "oauth2"
+    # RFC 9126 section 2.1: request_uri is refused here (_no_request_uri)
+    resolves_pushed_requests = False
 
     def __init__(self, upstream_get, **kwargs):
         Authorization.__init__(self, upstream_get, **kwargs)

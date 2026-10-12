@@ -20,6 +20,7 @@ from idpyoidc.server.configure import OPConfiguration
 from idpyoidc.server.oauth2.add_on.dpop import DPoPProof
 from idpyoidc.server.oauth2.add_on.dpop import DPoPErrorResponse
 from idpyoidc.server.oauth2.add_on.dpop import access_token_hash
+from idpyoidc.server.oauth2.add_on.dpop import par_post_parse_request
 from idpyoidc.server.oauth2.add_on.dpop import token_post_parse_request
 from idpyoidc.server.oauth2.authorization import Authorization
 from idpyoidc.server.oidc.token import Token
@@ -261,7 +262,7 @@ class TestEndpoint(object):
 
     def test_post_parse_request(self):
         auth_req = token_post_parse_request(
-            AUTH_REQ,
+            AUTH_REQ.copy(),
             AUTH_REQ["client_id"],
             self.context,
             http_info={
@@ -448,6 +449,61 @@ class TestEndpoint(object):
         _token = self.session_manager.find_token(_session_info["branch_id"], access_token)
         assert _token.token_type == "DPoP"
 
+
+    def _code_token(self, code, key=None):
+        headers = {"dpop": fresh_proof(key=key)} if key else {}
+        _req = self.token_endpoint.parse_request(
+            {**TOKEN_REQ.to_dict(), "code": code.value},
+            http_info={"headers": headers, "url": "https://server.example.com/token", "method": "POST"},
+        )
+        return self.token_endpoint.process_request(request=_req)
+
+    def test_code_bound_by_dpop_jkt_needs_that_key(self):
+        # RFC 9449 section 10: dpop_jkt in the authorization request binds the code.
+        key = new_ec_key(crv="P-256")
+        auth_req = AUTH_REQ.copy()
+        auth_req["dpop_jkt"] = as_unicode(key.thumbprint("SHA-256"))
+        session_id = self._create_session(auth_req)
+        code = self._mint_code(self.session_manager[session_id], auth_req["client_id"])
+
+        other = self._code_token(code, new_ec_key(crv="P-256"))
+        assert isinstance(other, DPoPErrorResponse) and other["error"] == "invalid_dpop_proof"
+        without = self._code_token(code)
+        assert isinstance(without, DPoPErrorResponse) and without["error"] == "invalid_dpop_proof"
+        # The refused attempts did not use up the code.
+        same = self._code_token(code, key)
+        assert same["response_args"]["token_type"] == "DPoP"
+
+    def _par(self, request, headers):
+        return par_post_parse_request(
+            request,
+            request["client_id"],
+            self.context,
+            http_info={"headers": headers, "url": "https://server.example.com/par", "method": "POST"},
+        )
+
+    def test_par_dpop_proof_binds_its_key(self):
+        # RFC 9449 section 10.1
+        key = new_ec_key(crv="P-256")
+        proof = fresh_proof(htu="https://server.example.com/par", key=key)
+        request = self._par(AUTH_REQ.copy(), {"dpop": proof})
+        assert request["dpop_jkt"] == as_unicode(key.thumbprint("SHA-256"))
+
+    def test_par_dpop_proof_must_match_dpop_jkt(self):
+        auth_req = AUTH_REQ.copy()
+        auth_req["dpop_jkt"] = as_unicode(new_ec_key(crv="P-256").thumbprint("SHA-256"))
+        result = self._par(auth_req, {"dpop": fresh_proof(htu="https://server.example.com/par")})
+        self._refused(result, "dpop_jkt")
+
+    def test_par_invalid_dpop_proof_is_refused(self):
+        self._refused(self._par(AUTH_REQ.copy(), {"dpop": "not-a-jwt"}), "")
+        # A proof for another endpoint is refused too.
+        self._refused(self._par(AUTH_REQ.copy(), {"dpop": fresh_proof()}), "htu")
+
+    def test_par_without_dpop_proof_is_unchanged(self):
+        auth_req = AUTH_REQ.copy()
+        auth_req["dpop_jkt"] = "jkt"
+        assert self._par(auth_req, {})["dpop_jkt"] == "jkt"
 
 def test_jti_cache_accepts_a_proof_once_under_concurrency():
     """NISCY fork: the same proof sent by many requests at once is accepted once."""

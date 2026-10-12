@@ -255,6 +255,59 @@ def token_post_parse_request(request, client_id, context, **kwargs):
     return request
 
 
+def par_post_parse_request(request, client_id, context, **kwargs):
+    """
+    Validates the DPoP proof of a pushed authorization request, if there is
+    one, and records its key thumbprint as ``dpop_jkt`` (RFC 9449 section
+    10.1): the code can then only be redeemed with a proof by that key.
+
+    The proof's ``htu`` must be one of the configured ``par_allowed_htu``, or
+    the request URL when none are configured.
+
+    :return: the request, or a DPoPErrorResponse (invalid_dpop_proof)
+    """
+
+    _http_info = kwargs.get("http_info")
+    if not _http_info:
+        return request
+
+    _header = (_http_info.get("headers") or {}).get("dpop")
+    if not _header:
+        return request
+
+    allowed_htu = _dpop_conf(context).get("par_allowed_htu") or [_http_info.get("url", "")]
+    try:
+        _, _jkt = verify_proof(_header, _http_info.get("method"), allowed_htu, context)
+    except InvalidDPoPProof as err:
+        logger.warning("DPoP proof refused: %s", err)
+        return DPoPErrorResponse(error="invalid_dpop_proof", error_description=str(err))
+
+    # RFC 9449 section 10.1: both given, they must name the same key.
+    if request.get("dpop_jkt") and request["dpop_jkt"] != _jkt:
+        return DPoPErrorResponse(
+            error="invalid_dpop_proof", error_description="dpop_jkt does not match the DPoP proof key"
+        )
+    request["dpop_jkt"] = _jkt
+    return request
+
+
+def authorization_request_jkt_error(grant, request) -> Optional[DPoPErrorResponse]:
+    """
+    A code from an authorization request with ``dpop_jkt`` (RFC 9449 section
+    10) is only redeemed with a proof by that key.
+
+    :return: a DPoPErrorResponse (invalid_dpop_proof) if the token request's
+        key is missing or another one, else None
+    """
+    _jkt = (grant.authorization_request or {}).get("dpop_jkt")
+    if _jkt and request.get("dpop_jkt") != _jkt:
+        return DPoPErrorResponse(
+            error="invalid_dpop_proof",
+            error_description="DPoP key differs from the key bound in the authorization request",
+        )
+    return None
+
+
 def userinfo_post_parse_request(request, client_id, context, auth_info, **kwargs):
     """
     Validates the DPoP proof sent with a DPoP-bound access token (including
@@ -313,8 +366,14 @@ def add_support(endpoint: dict, **kwargs):
         "algs_supported": _algs_supported,
         # Public URLs of the token endpoint a proof's htu may name
         "allowed_htu": list(kwargs.get("allowed_htu") or []),
+        # Public URLs of the pushed authorization endpoint a proof's htu may name
+        "par_allowed_htu": list(kwargs.get("par_allowed_htu") or []),
         "jti_cache": JtiCache(),
     }
+
+    _par_endpoint = endpoint.get("pushed_authorization")
+    if _par_endpoint:
+        _par_endpoint.post_parse_request.append(par_post_parse_request)
     _context.client_authn_methods["dpop"] = DPoPClientAuth(BearerHeader)
 
     for _dpop_endpoint in kwargs.get("dpop_endpoints", ["userinfo"]):

@@ -7,6 +7,7 @@ from cryptojwt.jws.exception import NoSuitableSigningKeys
 from cryptojwt.jwt import utc_time_sans_frac
 
 from idpyoidc.message import Message
+from idpyoidc.server.oauth2.add_on.dpop import authorization_request_jkt_error
 from idpyoidc.server.oauth2.token_helper import TokenEndpointHelper
 from idpyoidc.server.oauth2.token_helper import redemption_lock
 from idpyoidc.server.session.token import AuthorizationCode
@@ -75,6 +76,10 @@ class AccessTokenHelper(TokenEndpointHelper):
             _dpop_enabled = True
 
         if _dpop_enabled:
+            # Before the grant is bound to this request's key; the code stays unused.
+            _jkt_error = authorization_request_jkt_error(grant, req)
+            if _jkt_error:
+                return _jkt_error
             _dpop_jkt = req.get("dpop_jkt")
             if _dpop_jkt:
                 grant.extra["dpop_jkt"] = _dpop_jkt

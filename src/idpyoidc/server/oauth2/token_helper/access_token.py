@@ -8,6 +8,7 @@ from cryptojwt.utils import importer
 from idpyoidc.exception import ImproperlyConfigured
 from idpyoidc.message import Message
 from idpyoidc.message.oauth2 import TokenErrorResponse
+from idpyoidc.server.oauth2.add_on.dpop import authorization_request_jkt_error
 from idpyoidc.util import sanitize
 
 from ...session import MintingNotAllowed
@@ -82,6 +83,10 @@ class AccessTokenHelper(TokenEndpointHelper):
             _dpop_enabled = False
 
         if _dpop_enabled:
+            # Before the grant is bound to this request's key; the code stays unused.
+            _jkt_error = authorization_request_jkt_error(grant, req)
+            if _jkt_error:
+                return _jkt_error
             _dpop_jkt = req.get("dpop_jkt")
             if _dpop_jkt:
                 grant.extra["dpop_jkt"] = _dpop_jkt

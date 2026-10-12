@@ -207,12 +207,6 @@ class TestPushedAuthorization:
         _uri = self._request_uri()
         assert_error(self.endpoint.parse_request(args(request_uri=_uri)), "invalid_request_uri")
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="RFC 9126 section 4: the authorization request may be just client_id and "
-        "request_uri; the request is verified (response_type, redirect_uri required) "
-        "before request_uri is resolved",
-    )
     def test_minimal_request_with_request_uri(self):
         _uri = self._request_uri()
         _req = self.endpoint.parse_request({"client_id": "client_1", "request_uri": _uri})
