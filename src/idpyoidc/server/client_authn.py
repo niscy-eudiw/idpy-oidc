@@ -470,6 +470,8 @@ class ClientAuthenticationAttestation(ClientAuthnMethod):
         "client_status",
     )
     PRIVATE_JWK_FIELDS = {"d", "p", "q", "dp", "dq", "qi", "k"}
+    # Status validator context for the status list behind the WIA's client_status
+    STATUS_VALIDATION_CONTEXT = "WalletOrKeyStorageStatus"
 
     def __init__(self, upstream_get):
         super().__init__(upstream_get)
@@ -664,14 +666,21 @@ class ClientAuthenticationAttestation(ClientAuthnMethod):
 
         logger.debug("Verified Client Attestation PoP.")
 
-    def check_wia_revocation(self, url: str, status_idx: int, status_uri: str, timeout: int = 10) -> bool:
+    def check_wia_revocation(
+        self,
+        url: str,
+        status_idx: int,
+        status_uri: str,
+        validation_context: str = STATUS_VALIDATION_CONTEXT,
+        timeout: int = 10,
+    ) -> bool:
         """
         Calls status-list-validator to check whether the status list entry
         referenced by the WIA's client_status.status is revoked.
 
         Returns True if revoked, False if valid.
         """
-        payload = {"idx": status_idx, "uri": status_uri, "validation_context": "PIDStatus"}
+        payload = {"idx": status_idx, "uri": status_uri, "validation_context": validation_context}
         headers = {"accept": "application/json", "Content-Type": "application/json"}
 
         response = requests.post(f"{url}", json=payload, headers=headers, timeout=timeout)
@@ -761,6 +770,7 @@ class ClientAuthenticationAttestation(ClientAuthnMethod):
         trusted_attesters=None,
         trust_validator_url=None,
         status_validator_url=None,
+        status_validation_context=None,
         skip_client_id_check=False,
         **kwargs,
     ):
@@ -776,6 +786,7 @@ class ClientAuthenticationAttestation(ClientAuthnMethod):
                     url=status_validator_url,
                     status_idx=_status_list_ref["idx"],
                     status_uri=_status_list_ref["uri"],
+                    validation_context=status_validation_context or self.STATUS_VALIDATION_CONTEXT,
                 )
             except Exception as e:
                 logger.error(f"Error checking WIA revocation status: {e}")
@@ -858,6 +869,7 @@ class ClientAuthenticationAttestation(ClientAuthnMethod):
             trusted_attesters=trusted_attesters,
             trust_validator_url=trust_validator_url,
             status_validator_url=kwargs.get("status_validator_url"),
+            status_validation_context=kwargs.get("status_validation_context"),
             skip_client_id_check=bool(kwargs.get("skip_client_id_check")),
         )
         self.verify_pop(_wia=_wia, _pop_raw=pop_raw, audiences=self._audiences(endpoint, kwargs.get("pop_allowed_aud")))

@@ -314,6 +314,25 @@ def test_revoked_wia(method, pki, anchors, monkeypatch):
         authenticate(method, make_wia(pki), make_pop(pki), trusted_attesters_path=anchors, status_validator_url="https://s")
 
 
+@pytest.mark.parametrize(
+    "configured, expected",
+    [(None, "WalletOrKeyStorageStatus"), ("CustomStatus", "CustomStatus")],
+)
+def test_revocation_check_validation_context(method, pki, anchors, monkeypatch, configured, expected):
+    sent = {}
+
+    def post(url, json, **kwargs):
+        sent.update(json)
+        return SimpleNamespace(json=lambda: {"valid": True}, raise_for_status=lambda: None)
+
+    monkeypatch.setattr("idpyoidc.server.client_authn.requests.post", post)
+    kwargs = {"status_validation_context": configured} if configured else {}
+    authenticate(
+        method, make_wia(pki), make_pop(pki), trusted_attesters_path=anchors, status_validator_url="https://s", **kwargs
+    )
+    assert sent["validation_context"] == expected
+
+
 @pytest.mark.parametrize("wia", ["", "not-a-jws", "a.b"])
 def test_malformed_wia_is_an_authentication_error(method, pki, anchors, wia):
     with pytest.raises(ClientAuthenticationError):
