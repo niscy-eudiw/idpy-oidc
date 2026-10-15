@@ -56,8 +56,10 @@ def _ec_jwk(private_key, with_private=False):
     return key
 
 
-def _sign(claims, private_key, headers, alg="ES256"):
-    return JWS(claims, alg=alg).sign_compact(keys=[_ec_jwk(private_key, with_private=True)], **headers)
+def _sign(claims, private_key, headers, alg="ES256", kid=None):
+    key = _ec_jwk(private_key, with_private=True)
+    key.kid = kid or ""  # cryptojwt puts the signing key's kid in the header
+    return JWS(claims, alg=alg).sign_compact(keys=[key], **headers)
 
 
 class Pki:
@@ -74,7 +76,7 @@ def pki():
     return Pki()
 
 
-def make_wia(pki, signer=None, x5c=None, **overrides):
+def make_wia(pki, signer=None, x5c=None, kid=None, **overrides):
     now = int(time.time())
     claims = {
         "iss": "https://wallet-provider.example.com",
@@ -96,14 +98,14 @@ def make_wia(pki, signer=None, x5c=None, **overrides):
     headers["x5c"] = x5c if x5c is not None else [_der_b64(pki.provider), _der_b64(pki.ca)]
     if headers["x5c"] == []:
         del headers["x5c"]
-    return _sign(claims, signer or pki.provider_key, headers)
+    return _sign(claims, signer or pki.provider_key, headers, kid=kid)
 
 
-def make_pop(pki, aud=ISSUER, iss=CLIENT_ID, jti=None, iat=None):
+def make_pop(pki, aud=ISSUER, iss=CLIENT_ID, jti=None, iat=None, kid=None):
     claims = {"aud": aud, "jti": jti or str(uuid.uuid4()), "iat": iat or int(time.time())}
     if iss:
         claims["iss"] = iss
-    return _sign(claims, pki.instance_key, {"typ": "oauth-client-attestation-pop+jwt"})
+    return _sign(claims, pki.instance_key, {"typ": "oauth-client-attestation-pop+jwt"}, kid=kid)
 
 
 class FakeServer:
@@ -279,11 +281,30 @@ def test_pop_stale(method, pki, anchors):
         authenticate(method, make_wia(pki), make_pop(pki, iat=int(time.time()) - 3600), trusted_attesters_path=anchors)
 
 
-def test_pop_signed_by_other_key(method, pki, anchors):
+@pytest.mark.parametrize("pop_kid", [None, "wallet-key-1"])
+def test_pop_signed_by_other_key(method, pki, anchors, pop_kid):
     wia = make_wia(pki)
     pki.instance_key = ec.generate_private_key(ec.SECP256R1())
     with pytest.raises(ClientAuthenticationError, match="PoP signature"):
-        authenticate(method, wia, make_pop(pki), trusted_attesters_path=anchors)
+        authenticate(method, wia, make_pop(pki, kid=pop_kid), trusted_attesters_path=anchors)
+
+
+@pytest.mark.parametrize("cnf_kid", [None, "cnf-kid"])
+@pytest.mark.parametrize("pop_kid", [None, "cnf-kid", "wallet-key-1"])
+def test_pop_kid_is_only_a_hint(method, pki, anchors, cnf_kid, pop_kid):
+    # The PoP key is the WIA cnf key whatever kid either side carries (iOS wallets send one).
+    jwk = _ec_jwk(pki.instance_key).serialize()
+    if cnf_kid:
+        jwk["kid"] = cnf_kid
+    wia = make_wia(pki, cnf={"jwk": jwk})
+    res = authenticate(method, wia, make_pop(pki, kid=pop_kid), trusted_attesters_path=anchors)
+    assert res["client_id"] == CLIENT_ID
+
+
+def test_wia_kid_with_x5c(method, pki, anchors):
+    wia = make_wia(pki, kid="11")
+    res = authenticate(method, wia, make_pop(pki), trusted_attesters_path=anchors)
+    assert res["client_id"] == CLIENT_ID
 
 
 @pytest.mark.parametrize(

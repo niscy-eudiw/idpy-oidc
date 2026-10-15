@@ -544,9 +544,20 @@ class ClientAuthenticationAttestation(ClientAuthnMethod):
                 raise ClientAuthenticationError(f"WIA certificate {position} is not issued by the next one.")
         return chain
 
+    @staticmethod
+    def _accept_header_kid(jws, key):
+        """The verification key is fixed by context (x5c leaf, trusted attester or WIA cnf).
+
+        'kid' is only a hint (RFC 7515 section 4.1.4) and the attestation draft puts no
+        requirement on it, but cryptojwt drops any key whose kid differs from the header's.
+        """
+        key.kid = jws.jwt.headers.get("kid") or ""
+        return key
+
     def _verify_with(self, raw: str, key, alg: str) -> bool:
         try:
-            factory(raw).verify_compact(raw, keys=[key], sigalg=alg)
+            jws = factory(raw)
+            jws.verify_compact(raw, keys=[self._accept_header_kid(jws, key)], sigalg=alg)
             return True
         except Exception as err:
             logger.debug(f"WIA signature check failed: {err.__class__.__name__}")
@@ -626,9 +637,9 @@ class ClientAuthenticationAttestation(ClientAuthnMethod):
         except Exception:
             raise ClientAuthenticationError("Client Attestation 'cnf.jwk' is not a usable public key.")
         try:
-            _pop = jws.verify_compact(_pop_raw, keys=[key], sigalg=_alg)
+            _pop = jws.verify_compact(_pop_raw, keys=[self._accept_header_kid(jws, key)], sigalg=_alg)
         except Exception as err:
-            logger.error(f"PoP signature verification failed: {err.__class__.__name__}")
+            logger.error(f"PoP signature verification failed: {err.__class__.__name__}: {err}")
             raise ClientAuthenticationError("PoP signature verification failed.")
 
         for claim in ("aud", "jti", "iat"):
