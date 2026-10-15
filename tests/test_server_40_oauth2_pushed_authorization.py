@@ -17,6 +17,7 @@ from idpyoidc.server.oauth2.authorization import Authorization
 from idpyoidc.server.oauth2.pushed_authorization import PushedAuthorization
 from idpyoidc.server.oidc.provider_config import ProviderConfiguration
 from idpyoidc.server.oidc.registration import Registration
+from idpyoidc.time_util import utc_time_sans_frac
 from tests import CRYPT_CONFIG
 from tests import SESSION_PARAMS
 
@@ -287,5 +288,22 @@ class TestEndpoint(object):
     def test_request_uri_is_single_use(self):
         _uri = self._pushed_request_uri()
         self.authorization_endpoint.parse_request({"client_id": "s6BhdRkqt3", "request_uri": _uri})
+        _req = self.authorization_endpoint.parse_request({"client_id": "s6BhdRkqt3", "request_uri": _uri})
+        assert _req["error"] == "invalid_request_uri"
+
+    def test_purge_expired_forgets_unredeemed_requests(self):
+        _old = self._pushed_request_uri()
+        _live = self._pushed_request_uri()
+        self.pushed_authorization_endpoint._expires_at[_old] = utc_time_sans_frac() - 1
+
+        assert self.pushed_authorization_endpoint.purge_expired() == 1
+
+        _par_db = self.pushed_authorization_endpoint.upstream_get("context").par_db
+        assert _old not in _par_db and _old not in self.pushed_authorization_endpoint._expires_at
+        assert _live in _par_db and _live in self.pushed_authorization_endpoint._expires_at
+
+    def test_expired_request_uri_is_rejected(self):
+        _uri = self._pushed_request_uri()
+        self.pushed_authorization_endpoint._expires_at[_uri] = utc_time_sans_frac() - 1
         _req = self.authorization_endpoint.parse_request({"client_id": "s6BhdRkqt3", "request_uri": _uri})
         assert _req["error"] == "invalid_request_uri"

@@ -43,11 +43,23 @@ class PushedAuthorization(Authorization):
 
     def is_expired(self, request_uri: str) -> bool:
         """An expired request_uri MUST be rejected (RFC 9126 section 4)."""
-        _now = utc_time_sans_frac()
-        for _uri in [u for u, exp in self._expires_at.items() if exp < _now and u != request_uri]:
-            del self._expires_at[_uri]
         _exp = self._expires_at.pop(request_uri, None)
-        return _exp is not None and _exp < _now
+        self.purge_expired()
+        return _exp is not None and _exp < utc_time_sans_frac()
+
+    def purge_expired(self) -> int:
+        """Forgets pushed requests that expired without being redeemed.
+
+        :return: The number of requests removed.
+        """
+        _now = utc_time_sans_frac()
+        _par_db = self.upstream_get("context").par_db
+        # list() snapshots the items so requests may be pushed meanwhile.
+        _expired = [u for u, exp in list(self._expires_at.items()) if exp < _now]
+        for _uri in _expired:
+            self._expires_at.pop(_uri, None)
+            _par_db.pop(_uri, None)
+        return len(_expired)
 
     def process_request(self, request: Optional[Union[Message, str]] = None, **kwargs):
         """
